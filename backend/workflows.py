@@ -1,5 +1,6 @@
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 from datetime import timedelta
 from typing import Dict, Any, Optional
 
@@ -31,7 +32,7 @@ class SupervisorWorkflow:
             initial_interval=timedelta(seconds=1), # The time to wait before the first retry attempt after a failure.
             maximum_interval=timedelta(seconds=10), # The maximum time to wait between retry attempts; the backoff will not exceed this value.
             backoff_coefficient=2.0, # The multiplier applied to the wait interval after each failed attempt (exponential backoff).
-            maximum_attempts=4 # The maximum number of retry attempts before giving up.
+            maximum_attempts=10 # The maximum number of retry attempts before giving up.
         )
 
     @workflow.run
@@ -52,12 +53,26 @@ class SupervisorWorkflow:
             retry_policy=self._default_retry_policy
         )
 
-        credit = await workflow.execute_activity(
-            "fetch_credit_report",
-            application["applicant_id"],
-            start_to_close_timeout=timedelta(seconds=60),
-            retry_policy=self._default_retry_policy
-        )
+        # Try CIBIL first, fallback to Experian if it fails
+        # This showcases Temporal's ability to handle provider failures gracefully
+        try:
+            credit = await workflow.execute_activity(
+                "fetch_credit_report_cibil",
+                application["applicant_id"],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2  # Don't retry CIBIL, fail fast and fallback
+                )
+            )
+        except ActivityError:
+            # If CIBIL fails, fallback to Experian
+            workflow.logger.info("CIBIL failed, falling back to Experian")
+            credit = await workflow.execute_activity(
+                "fetch_credit_report_experian",
+                application["applicant_id"],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=self._default_retry_policy
+            )
 
         # 2. Run specialist agents in parallel
         income_task = workflow.execute_activity(
@@ -88,8 +103,7 @@ class SupervisorWorkflow:
         decision = await workflow.execute_activity(
             "aggregate_and_decide",
             {"application": application, "income": income_res, "expense": expense_res, "credit": credit_res, "docs": docs},
-            start_to_close_timeout=timedelta(seconds=120),
-            retry_policy=self._default_retry_policy
+            start_to_close_timeout=timedelta(seconds=1200),
         )
 
         # 4. Prepare summary for human review and expose via query
